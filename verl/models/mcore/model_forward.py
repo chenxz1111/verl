@@ -418,12 +418,38 @@ def gptmodel_forward_model_engine(
         else:
             attention_mask = attention_mask_bshd
 
+        # Long-context memory relief (hidden-state chunked projection): when enabled, skip the model's
+        # output layer so `model(...)` returns hidden states [B, S, H] (~MBs) instead of the full
+        # [B, S, vocab] fp32 logits (tens of GB at 128k). The chunked logits_processor then projects
+        # hidden->logits one sequence-chunk at a time via the (restored) output layer. Requires
+        # sequence_parallel=False so hidden states are not TP-seq-sharded. Gated by env; default off.
+        import os as _os
+
+        _hidden_chunk = _os.environ.get("VERL_MCORE_HIDDEN_CHUNK", "0") not in ("0", "", "false", "False")
+        _um = unwrap_model(model)
+        # The output layer lives on the GPTModel directly, or on `.language_model` for VL wrappers
+        # (e.g. Qwen3_5VLModel). Resolve the owner so the passthrough swap targets the right module.
+        _ol_owner = _um if getattr(_um, "output_layer", None) is not None else getattr(_um, "language_model", None)
+        _real_output_layer = None
+        if _hidden_chunk and post_process and _ol_owner is not None and getattr(_ol_owner, "output_layer", None) is not None:
+            _real_output_layer = _ol_owner.output_layer
+
+            class _PassThroughOutputLayer(torch.nn.Module):
+                def forward(self, hidden_states_, *args_, **kwargs_):
+                    return hidden_states_, None
+
+            _ol_owner.output_layer = _PassThroughOutputLayer()
+
         output_orig = model(
             input_ids=input_ids_bshd,
             attention_mask=attention_mask,
             position_ids=None if vision_model else position_ids_bshd,
             **model_kwargs,
         )
+        if _real_output_layer is not None:
+            _ol_owner.output_layer = _real_output_layer  # restore for the chunked projection in logits_processor
+
+
         if post_process and logits_processor is not None:
             args = {
                 k: preprocess_bshd_engine(

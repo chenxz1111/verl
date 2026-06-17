@@ -915,14 +915,132 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
             def logits_processor(logits, label, temperature):
                 assert logits.shape[:2] == label.shape[:2]
+                if os.environ.get("VERL_DEBUG_LOGITS_SHAPE", "0") == "1":
+                    try:
+                        import torch.distributed as _d
+
+                        if not _d.is_initialized() or _d.get_rank() == 0:
+                            print(
+                                f"[LOGITS_PROCESSOR DEBUG] logits dim={logits.dim()} shape={tuple(logits.shape)} "
+                                f"is_nested={logits.is_nested} dtype={logits.dtype} | label dim={label.dim()} "
+                                f"shape={tuple(label.shape)} | grad={torch.is_grad_enabled()} entropy={calculate_entropy}",
+                                flush=True,
+                            )
+                    except Exception as _e:
+                        print(f"[LOGITS_PROCESSOR DEBUG] err {_e}", flush=True)
                 # avoid non-positive temperature such as padding
                 temperature[temperature <= 0] = 1e-8
                 assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
+
+                # Hidden-state chunked projection (long-context memory relief). When enabled upstream,
+                # `logits` is actually hidden states [B, S, H] (the model's output layer was skipped), so
+                # we project hidden->vocab-parallel logits ONE sequence-chunk at a time and never
+                # materialize the full [B, S, vocab] fp32 logits (45GB at 128k). copy_to_tensor_model_
+                # parallel_region replicates the column-parallel input handling (all-reduce of grad_hidden
+                # across TP in backward); checkpointing recomputes each chunk's projection+CE in backward.
+                _hidden_chunk = os.environ.get("VERL_MCORE_HIDDEN_CHUNK", "0") not in ("0", "", "false", "False")
+                if (
+                    _hidden_chunk
+                    and not distillation_use_topk
+                    and not calculate_sum_pi_squared
+                    and logits.dim() == 3
+                    and not logits.is_nested
+                ):
+                    from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
+
+                    _um_lp = unwrap_model(model)
+                    _ol = _um_lp if getattr(_um_lp, "output_layer", None) is not None else getattr(_um_lp, "language_model", None)
+                    _ow = _ol.output_layer.weight
+                    _hchunk = int(os.environ.get("VERL_MCORE_LOGITS_CHUNK", "8192") or 8192)
+                    _use_ckpt = os.environ.get("VERL_MCORE_LOGITS_CKPT", "0") not in ("0", "", "false", "False")
+                    seq_len = logits.shape[1]
+                    lp_chunks = []
+                    ent_chunks = [] if calculate_entropy else None
+
+                    def _project(h_chunk, temp_chunk):
+                        # h_chunk: [B, chunk, H] -> seq-first, replicate-for-TP, project, temperature, fp32
+                        h_sf = copy_to_tensor_model_parallel_region(h_chunk.transpose(0, 1).contiguous())
+                        # hidden states may be fp32; cast to the (bf16) vocab-weight dtype like the fused
+                        # path (qwen3_5.forward_with_torch_backend) before the column-parallel matmul.
+                        lc = torch.nn.functional.linear(h_sf.to(_ow.dtype), _ow)  # [chunk, B, vocab/tp]
+                        lc = lc.transpose(0, 1).float()  # [B, chunk, vocab/tp], match fp32 logits path
+                        return lc / temp_chunk.unsqueeze(dim=-1)
+
+                    def _proj_logprob(h_chunk, lbl_chunk, temp_chunk):
+                        return vocab_parallel_log_probs_from_logits(_project(h_chunk, temp_chunk), lbl_chunk)
+
+                    for s in range(0, seq_len, _hchunk):
+                        h_c = logits[:, s : s + _hchunk, :]
+                        lbl = label[:, s : s + _hchunk]
+                        tmp = temperature[:, s : s + _hchunk]
+                        if calculate_entropy:
+                            # entropy is computed only under no_grad (old_log_prob) -> safe, no checkpoint
+                            ent_chunks.append(vocab_parallel_entropy(_project(h_c, tmp)))
+                        if _use_ckpt and torch.is_grad_enabled():
+                            from torch.utils.checkpoint import checkpoint as _torch_ckpt
+
+                            lp_chunks.append(_torch_ckpt(_proj_logprob, h_c, lbl, tmp, use_reentrant=False))
+                        else:
+                            lp_chunks.append(_proj_logprob(h_c, lbl, tmp))
+                    ret = {}
+                    if calculate_entropy:
+                        ret["entropy"] = torch.cat(ent_chunks, dim=1)
+                    ret["log_probs"] = torch.cat(lp_chunks, dim=1)
+                    return ret
+
                 logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
                 ret = {}
                 # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy.
                 if calculate_sum_pi_squared:
                     ret["sum_pi_squared"] = vocab_parallel_sum_pi_squared(logits)
+
+                # Long-context memory relief: compute entropy/log_probs in sequence chunks so the
+                # full [seqlen x vocab] fp32 softmax / entropy clone is never materialized at once.
+                # Gated by env (0 = off, original behavior). Safe because entropy is only ever computed
+                # without grad (old_log_prob runs under no_grad; the update pass sets calculate_entropy=False),
+                # so the chunked slices never hit the entropy autograd in-place path. Only applies to the
+                # 3D non-nested bshd layout (micro_batch=1 single-sequence forward).
+                _chunk = int(os.environ.get("VERL_MCORE_LOGITS_CHUNK", "0") or 0)
+                if (
+                    not distillation_use_topk
+                    and _chunk > 0
+                    and logits.dim() == 3
+                    and not logits.is_nested
+                    and logits.shape[1] > _chunk
+                ):
+                    seq_len = logits.shape[1]
+                    lp_chunks = []
+                    ent_chunks = [] if calculate_entropy else None
+                    # Optional gradient checkpointing of the per-chunk log_prob: recompute the CE
+                    # (and its saved softmax) in backward instead of retaining it, so the UPDATE pass
+                    # peak stays at ~one chunk's softmax rather than the full [seqlen x vocab]. Gated by
+                    # env; only meaningful with grad (the update pass). entropy stays no-grad (logging).
+                    _use_ckpt = os.environ.get("VERL_MCORE_LOGITS_CKPT", "0") not in ("0", "", "false", "False")
+
+                    def _lp_fn(lc_slice, lbl_slice):
+                        return vocab_parallel_log_probs_from_logits(lc_slice.clone(), lbl_slice)
+
+                    for s in range(0, seq_len, _chunk):
+                        lc = logits[:, s : s + _chunk, :]
+                        lbl = label[:, s : s + _chunk]
+                        # Both vocab_parallel_entropy and Megatron's vocab_parallel_cross_entropy mutate
+                        # their input in-place (during fwd/bwd). `lc` is a slice (view) of `logits`; an
+                        # in-place write on it corrupts the slice's autograd (AsStridedBackward version
+                        # check). Pass contiguous clones so the in-place ops land on CloneBackward tensors
+                        # (whose backward needs no saved fwd value), letting grads flow cleanly to logits.
+                        if calculate_entropy:
+                            ent_chunks.append(vocab_parallel_entropy(lc.clone()))
+                        if _use_ckpt and torch.is_grad_enabled():
+                            from torch.utils.checkpoint import checkpoint as _torch_ckpt
+
+                            lp_chunks.append(_torch_ckpt(_lp_fn, lc, lbl, use_reentrant=False))
+                        else:
+                            lp_chunks.append(vocab_parallel_log_probs_from_logits(lc.clone(), lbl))
+                    if calculate_entropy:
+                        ret["entropy"] = torch.cat(ent_chunks, dim=1)
+                    ret["log_probs"] = torch.cat(lp_chunks, dim=1)
+                    return ret
+
                 if calculate_entropy:
                     logits_bak = logits.clone()
                     # # disable the hint until the fused_kernel is optimized for triton>=3.3
