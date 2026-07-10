@@ -544,15 +544,24 @@ class AgentLoopWorker:
         )
 
         # NOTE: __do_sample__ is an internal per-sample override used by REMAX combined rollout.
-        # Do not forward it to concrete agent loops, which may reject unknown kwargs.
+        # __sampling_params__ is an optional per-sample dict merged into the sampling params
+        # (e.g. {"max_new_tokens": ...} for mixed-role batches). Do not forward either to
+        # concrete agent loops, which may reject unknown kwargs.
         per_sample_do_sample = batch.non_tensor_batch.get("__do_sample__")
+        per_sample_sampling_params = batch.non_tensor_batch.get("__sampling_params__")
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
+            kwargs = {
+                k: v[i]
+                for k, v in batch.non_tensor_batch.items()
+                if k not in ("__do_sample__", "__sampling_params__")
+            }
             sample_sampling_params = dict(sampling_params)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
+            if per_sample_sampling_params is not None and per_sample_sampling_params[i]:
+                sample_sampling_params.update(dict(per_sample_sampling_params[i]))
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
