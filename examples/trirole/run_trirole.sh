@@ -154,6 +154,8 @@ python3 ${VERL_DIR}/examples/trirole/main_trirole.py \
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_MCORE_LOGITS_CHUNK=\"${VERL_MCORE_LOGITS_CHUNK:-0}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_MCORE_LOGITS_CKPT=\"${VERL_MCORE_LOGITS_CKPT:-0}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_MCORE_HIDDEN_CHUNK=\"${VERL_MCORE_HIDDEN_CHUNK:-0}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_MCORE_SAVE_ON_CPU=\"${VERL_MCORE_SAVE_ON_CPU:-0}\" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_MCORE_SAVE_ON_CPU_MIN_NUMEL=\"${VERL_MCORE_SAVE_ON_CPU_MIN_NUMEL:-268435456}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.TRIROLE_GRADE_PER_PROB=\"${TRIROLE_GRADE_PER_PROB:-2}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.TRIROLE_K_GRADE=\"${TRIROLE_K_GRADE:-4}\" \
   +ray_kwargs.ray_init.runtime_env.env_vars.TRIROLE_M_REFINE=\"${TRIROLE_M_REFINE:-8}\" \

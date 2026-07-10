@@ -669,17 +669,48 @@ class MegatronEngine(BaseEngine):
         # batch should be a list of batches inside micro-batches
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
 
+        # VERL_MCORE_SAVE_ON_CPU=1: during the UPDATE pass (forward_only=False), stash
+        # autograd-saved activation tensors in pinned CPU memory instead of GPU
+        # (torch.autograd.graph.save_on_cpu). With recompute_granularity=full the saved
+        # tensors are dominated by the ~40 layer-boundary activations (S x hidden each,
+        # ~43GB total at 256k) -- offloading them is what lets a single 261k-token
+        # sequence's backward fit on one 143GB device. The numel threshold (default
+        # 1<<28 = 256M elems ~ 512MB bf16) is chosen so ONLY those giant boundary
+        # activations are packed: every weight tensor (largest fused expert weight is
+        # ~67M elems) stays on GPU, bounding PCIe traffic to ~43GB/row each way. With
+        # PP=1 mcore runs fwd+bwd per micro-batch sequentially, so peak saved memory is
+        # a single row's. No effect on forward_only passes (log_prob/ref).
+        import contextlib
+
+        save_on_cpu_ctx = contextlib.nullcontext()
+        if not forward_only and os.getenv("VERL_MCORE_SAVE_ON_CPU", "0") == "1":
+            min_numel = int(os.getenv("VERL_MCORE_SAVE_ON_CPU_MIN_NUMEL", str(1 << 28)))
+            inner = torch.autograd.graph.save_on_cpu(pin_memory=True)
+
+            def _pack(t, _inner=inner, _min=min_numel):
+                if t.numel() < _min or not t.is_cuda:
+                    return t
+                return _inner.pack_hook(t)
+
+            def _unpack(packed, _inner=inner):
+                if isinstance(packed, torch.Tensor):
+                    return packed
+                return _inner.unpack_hook(packed)
+
+            save_on_cpu_ctx = torch.autograd.graph.saved_tensors_hooks(_pack, _unpack)
+
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=batch_generator,
-            model=self.module,
-            num_microbatches=n_micro_batch,
-            seq_length=1,  # the communication shape is obtained via p2p comm
-            micro_batch_size=1,  # the communication shape is obtained via p2p comm
-            forward_only=forward_only,
-        )
+        with save_on_cpu_ctx:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=batch_generator,
+                model=self.module,
+                num_microbatches=n_micro_batch,
+                seq_length=1,  # the communication shape is obtained via p2p comm
+                micro_batch_size=1,  # the communication shape is obtained via p2p comm
+                forward_only=forward_only,
+            )
 
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,

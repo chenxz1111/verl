@@ -23,6 +23,10 @@ export CALC_ENTROPY=False
 export VERL_MCORE_HIDDEN_CHUNK=1
 export VERL_MCORE_LOGITS_CHUNK=8192
 export VERL_MCORE_LOGITS_CKPT=1
+# G1: offload the ~40 giant layer-boundary activations (>=256M elems each) of the
+# update backward to pinned CPU memory. First 256k gate (G3, without this) OOM'd in
+# update_actor at ~130GB needing ~5GB more; everything before update passed.
+export VERL_MCORE_SAVE_ON_CPU=${VERL_MCORE_SAVE_ON_CPU:-1}
 export TRIROLE_GRADE_PER_PROB=2
 export TRIROLE_K_GRADE=2
 export TRIROLE_M_REFINE=4
