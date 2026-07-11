@@ -396,7 +396,7 @@ class TriRoleTrainer(RayPPOTrainer):
                                 prompt_ok.append(False)
                                 continue
                             msgs = build_grader_messages(problems[r // rollout_n], p)
-                            prompt_ok.append(self._tokenize_len(msgs) <= max_prompt_tokens - 8)
+                            prompt_ok.append(self._tokenize_len(msgs) <= max_prompt_tokens - 512)
                         grade_picks, refine_base = self._pick_targets(
                             tiers, publics, prompt_ok, rollout_n, grade_per_prob
                         )
@@ -456,7 +456,7 @@ class TriRoleTrainer(RayPPOTrainer):
                             cands.sort(key=lambda c: c[0])
                             med = cands[len(cands) // 2]
                             msgs = build_refine_messages(problems[p], publics[base], med[1], med[2])
-                            if self._tokenize_len(msgs) > max_prompt_tokens - 8:
+                            if self._tokenize_len(msgs) > max_prompt_tokens - 512:
                                 continue
                             refine_specs.append({
                                 "prob_idx": p,
