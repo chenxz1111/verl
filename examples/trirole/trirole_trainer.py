@@ -86,6 +86,18 @@ def _public_part(text: str) -> str:
     return text[closes[-1].end():].strip()
 
 
+def _log_wave(name: str, wave: DataProto, secs) -> None:
+    """Mid-step observability: one line per wave with response-length percentiles."""
+    prompt_w = wave.batch["prompts"].shape[1]
+    lens = wave.batch["attention_mask"][:, prompt_w:].sum(dim=1).float()
+    q = torch.quantile(lens, torch.tensor([0.5, 0.9, 1.0]))
+    print(
+        f"[trirole] {name} wave: {len(wave)} rows in {(secs or 0):.0f}s, "
+        f"resp tokens p50/p90/max = {int(q[0])}/{int(q[1])}/{int(q[2])}",
+        flush=True,
+    )
+
+
 class TriRoleTrainer(RayPPOTrainer):
     """RayPPOTrainer with the rollout section replaced by the three-wave tri-role DAG."""
 
@@ -378,6 +390,7 @@ class TriRoleTrainer(RayPPOTrainer):
                     reward_extra_keys = list(solve_out.meta_info.get("reward_extra_keys", []))
                     batch = batch.repeat(repeat_times=rollout_n, interleave=True)
                     batch = batch.union(solve_out)
+                    _log_wave("solve", batch, timing_raw.get("gen"))
                     waves = [batch]
 
                     # ---------------- selection ----------------
@@ -399,6 +412,13 @@ class TriRoleTrainer(RayPPOTrainer):
                             prompt_ok.append(self._tokenize_len(msgs) <= max_prompt_tokens - 512)
                         grade_picks, refine_base = self._pick_targets(
                             tiers, publics, prompt_ok, rollout_n, grade_per_prob
+                        )
+                        print(
+                            f"[trirole] picks: grade_targets="
+                            f"{sum(len(p) for p in grade_picks)} refine_bases="
+                            f"{sum(1 for b in refine_base if b is not None)} "
+                            f"solve_tiers={np.bincount(np.clip(tiers, 0, 7), minlength=8).tolist()}",
+                            flush=True,
                         )
 
                     # ---------------- wave 2: GRADE ----------------
@@ -422,6 +442,7 @@ class TriRoleTrainer(RayPPOTrainer):
                             snapshot, grade_specs, "grade", k_grade, grade_max_new
                         )
                         grade_batch = self._generate_wave(grade_rows, timing_raw, "gen_grade")
+                        _log_wave("grade", grade_batch, timing_raw.get("gen_grade"))
                         waves.append(grade_batch)
 
                     # ---------------- wave 3: REFINE ----------------
@@ -472,6 +493,7 @@ class TriRoleTrainer(RayPPOTrainer):
                                 snapshot, refine_specs, "refine", m_refine, refine_max_new
                             )
                             refine_batch = self._generate_wave(refine_rows, timing_raw, "gen_refine")
+                            _log_wave("refine", refine_batch, timing_raw.get("gen_refine"))
                             waves.append(refine_batch)
 
                     self.checkpoint_manager.sleep_replicas()

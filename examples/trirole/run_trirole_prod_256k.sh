@@ -17,8 +17,8 @@ set -euo pipefail
 export GEMINI_API_KEY=${GEMINI_API_KEY:?set GEMINI_API_KEY}
 export STAGE=C   # placeholder; lengths overridden below
 export MAX_PROMPT_OVERRIDE=12288
-export MAX_RESP_OVERRIDE=248832
-export TRAIN_BSZ_OVERRIDE=${TRAIN_BSZ_OVERRIDE:-24}
+export MAX_RESP_OVERRIDE=${MAX_RESP_OVERRIDE:-204800}
+export TRAIN_BSZ_OVERRIDE=${TRAIN_BSZ_OVERRIDE:-12}
 export N_OVERRIDE=${N_OVERRIDE:-8}
 export GMU_OVERRIDE=${GMU_OVERRIDE:-0.55}
 export CALC_ENTROPY=False
@@ -35,7 +35,7 @@ export TRIROLE_DROP_ZERO_VAR=1
 export EPOCHS=${EPOCHS:-1}
 export SAVE_FREQ=${SAVE_FREQ:-10}
 export TEST_FREQ=${TEST_FREQ:-25}
-export EXP=${EXP:-trirole_256k_v4_b16}
+export EXP=${EXP:-trirole_256k_v4_b12}
 export CKPT_DIR=/nvme4/cxz/ckpts/qwen36_35b_a3b_trirole/${EXP}
 export DATA_DIR=${DATA_DIR:-/nvme3/cxz/unimath_data/rl_data/data/trirole_v4}
 
