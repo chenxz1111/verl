@@ -47,14 +47,22 @@ def public(text: str) -> str:
     return text[i + 8:].strip() if i >= 0 else ""
 
 
-async def judge_tier(sol: str, gt: str, problem: str) -> int:
+async def _judge_one(sol: str, gt: str, problem: str) -> int:
     ei = {"reward_spec_json": json.dumps({"judge": JUDGE, "problem_statement": problem, "solution": gt}),
           "problem_statement": problem, "reference_solution": gt, "trirole_role": "solve"}
     r = await R.compute_score(solution_str=sol, ground_truth=gt, extra_info=ei)
     return int(r["tier"])
 
 
-async def main() -> None:
+def judge_many(items) -> list[int]:
+    """items: [(solution_text, ground_truth, problem)] -> tiers. One event loop per call
+    (sglang Engine owns the ambient loop between calls, so judging must not share it)."""
+    async def _run():
+        return list(await asyncio.gather(*[_judge_one(s, g, p) for s, g, p in items]))
+    return asyncio.run(_run())
+
+
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--tag", required=True)
@@ -94,12 +102,13 @@ async def main() -> None:
     passn = max(args.pass_n, args.pipe_p)
     solve_prompts = [render(build_solver_messages(pr)) for pr in probs for _ in range(passn)]
     solve_out = [o["text"] for o in llm.generate(solve_prompts, sp_val)]
-    pass_tiers = []
-    for i, pr in enumerate(probs):
-        ts = await asyncio.gather(*[judge_tier(public(solve_out[i * passn + j]), gts[i], pr)
-                                    for j in range(args.pass_n)])
-        pass_tiers.append(sum(ts) / len(ts))
+    items = [(public(solve_out[i * passn + j]), gts[i], probs[i])
+             for i in range(len(probs)) for j in range(args.pass_n)]
+    flat = judge_many(items)
+    pass_tiers = [sum(flat[i * args.pass_n:(i + 1) * args.pass_n]) / args.pass_n
+                  for i in range(len(probs))]
     pass1 = sum(pass_tiers) / len(pass_tiers) / 7.0
+    print(f"[eval] pass@1 = {pass1:.4f}", flush=True)
 
     # ---- B) pipeline: solve(temp1.0)xP -> self-grade -> pick -> refine -> judge ----
     pipe_prompts = [render(build_solver_messages(pr)) for pr in probs for _ in range(args.pipe_p)]
@@ -132,14 +141,13 @@ async def main() -> None:
     refine_out = [o["text"] for o in llm.generate(refine_prompts, sp_solve)] if refine_prompts else []
     for k, i in enumerate(rmap):
         chosen[i] = public(refine_out[k]) or chosen[i]
-    pipe_tiers = await asyncio.gather(*[judge_tier(chosen[i], gts[i], probs[i]) for i in range(len(probs))])
+    pipe_tiers = judge_many([(chosen[i], gts[i], probs[i]) for i in range(len(probs))])
     pipeline = sum(pipe_tiers) / len(pipe_tiers) / 7.0
     # oracle: best-of-P by judge (upper bound)
-    bo_tiers = []
-    for i, pr in enumerate(probs):
-        ts = await asyncio.gather(*[judge_tier(public(pipe_solves[i * args.pipe_p + j]), gts[i], pr)
-                                    for j in range(args.pipe_p)])
-        bo_tiers.append(max(ts))
+    items = [(public(pipe_solves[i * args.pipe_p + j]), gts[i], probs[i])
+             for i in range(len(probs)) for j in range(args.pipe_p)]
+    flat = judge_many(items)
+    bo_tiers = [max(flat[i * args.pipe_p:(i + 1) * args.pipe_p]) for i in range(len(probs))]
     best_of_p = sum(bo_tiers) / len(bo_tiers) / 7.0
 
     res = {"tag": args.tag, "model": args.model, "n_problems": len(probs),
@@ -153,4 +161,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
