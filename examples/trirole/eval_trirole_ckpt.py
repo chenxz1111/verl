@@ -35,7 +35,9 @@ JUDGE = {
     "api_key_env": "GEMINI_API_KEY",
     "template_path": "/nvme3/cxz/unimath_data/rl_data/templates/evaluation_06-05version.yaml",
     "template_name": "with_solution", "system_prompt": "You are a helpful assistant.",
-    "require_think_close": True, "temperature": 0.0, "max_completion_tokens": 4096,
+    # We pass already-think-stripped public text to the judge, so the strict
+    # "must contain </think>" gate must be off here (it's for raw rollouts).
+    "require_think_close": False, "temperature": 0.0, "max_completion_tokens": 4096,
     "reward_scale": 7.0, "extra_body": {"stream": False},
 }
 
