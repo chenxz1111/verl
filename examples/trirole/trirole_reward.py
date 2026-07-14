@@ -229,7 +229,17 @@ async def _judge_one(solution_str: str, ground_truth: str, extra_info: dict[str,
             if points is None:
                 raise ValueError(f"no <score> in judge reply: {reply[:200]!r}")
             tier = bucket(points)
-            return _result(float(tier) / scale, points, tier, role, model, latency=time.time() - started)
+            reward = float(tier) / scale
+            # SCoRe-lite degradation penalty (refine only, default off): if a refine
+            # scores strictly below its draft's tier, subtract a flat penalty so the
+            # policy is not rewarded for the least-bad regression. The GRPO group
+            # baseline still carries the main relative-improvement signal.
+            if role == "refine":
+                base_tier = int(extra_info.get("trirole_base_tier", -1))
+                pen = float(os.getenv("TRIROLE_REFINE_DEGRADE_PENALTY", "0"))
+                if pen > 0 and base_tier in VALID_TIERS and tier < base_tier:
+                    reward = max(0.0, reward - pen)
+            return _result(reward, points, tier, role, model, latency=time.time() - started)
         except Exception as exc:  # noqa: BLE001 - never let a judge failure kill a step
             last_error = exc
             if attempt < max_retries:
